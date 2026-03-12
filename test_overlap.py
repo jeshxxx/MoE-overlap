@@ -15,8 +15,10 @@ This script benchmarks two modes:
   - Overlapped: dispatch runs async on comm stream, linear runs on default
     stream in parallel, then synchronizes
 
-Run:
-    torchrun --nproc_per_node=<num_gpus> test_overlap.py
+Run (mpirun):
+    mpirun --allow-run-as-root -np 8 python3 test_overlap.py
+Run (torchrun):
+    torchrun --nproc_per_node=8 test_overlap.py
 """
 
 import os
@@ -31,10 +33,53 @@ from deep_ep.utils import EventHandle, EventOverlap
 from fused_a2a import get_buffer, get_hidden_bytes
 
 
+def _env_first(*keys, default="0"):
+    """Return the first non-empty value among environment variable keys."""
+    for k in keys:
+        v = os.environ.get(k)
+        if v:
+            return v
+    return default
+
+
 def setup():
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
+    """Initialize distributed, supporting mpirun / torchrun / srun launchers."""
+    local_rank = int(_env_first(
+        "LOCAL_RANK",                   # torchrun
+        "OMPI_COMM_WORLD_LOCAL_RANK",   # OpenMPI
+        "MV2_COMM_WORLD_LOCAL_RANK",    # MVAPICH
+        "MPI_LOCALRANKID",              # MPICH / Intel MPI
+        default="0",
+    ))
+    rank = int(_env_first(
+        "RANK",                         # torchrun
+        "OMPI_COMM_WORLD_RANK",         # OpenMPI
+        "MV2_COMM_WORLD_RANK",          # MVAPICH
+        "PMI_RANK",                     # MPICH / Intel MPI
+        default="0",
+    ))
+    world_size = int(_env_first(
+        "WORLD_SIZE",                   # torchrun
+        "OMPI_COMM_WORLD_SIZE",         # OpenMPI
+        "MV2_COMM_WORLD_SIZE",          # MVAPICH
+        "PMI_SIZE",                     # MPICH / Intel MPI
+        default="1",
+    ))
+
+    # Force-set so that PyTorch env:// rendezvous can read them
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+
     torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+
+    if rank == 0:
+        print(f"[setup] rank={rank}, world_size={world_size}, "
+              f"local_rank={local_rank}")
+
     return local_rank
 
 
