@@ -116,9 +116,8 @@ class FusedDispatch(torch.autograd.Function):
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
 
-        # Make sure current stream is synchronized
-        if async_finish:
-            after_event_overlap.current_stream_wait()
+        # When async_finish=True the caller is responsible for synchronising
+        # via dispatch_wait() *after* overlapping computation has been issued.
 
         # Save for backward
         ctx.group = group
@@ -127,11 +126,15 @@ class FusedDispatch(torch.autograd.Function):
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
         tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
 
-        return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
+        return (
+            recv_x, recv_token_indices, recv_token_probs,
+            tokens_per_expert, handle, after_event_overlap,
+        )
 
     @staticmethod
     def backward(
-        ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle
+        ctx, grad_output, grad_token_indices, grad_token_probs,
+        grad_tokens_per_expert, grad_handle, grad_after_event,
     ):
         """Backward pass of fused dispatch."""
         buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
@@ -170,18 +173,18 @@ class FusedCombine(torch.autograd.Function):
             previous_event=previous_event,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
-        # Make sure current stream is synchronized
-        if async_finish:
-            after_event.current_stream_wait()
+
+        # When async_finish=True the caller is responsible for synchronising
+        # via dispatch_wait() *after* overlapping computation has been issued.
 
         ctx.handle = handle
         ctx.group = group
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
-        return combined_x, None
+        return combined_x, None, after_event
 
     @staticmethod
-    def backward(ctx, grad_output, previous_event=None):
+    def backward(ctx, grad_output, grad_none, grad_after_event):
         """Backward pass of fused combine."""
         previous_event = None
         if ctx.async_finish:
@@ -200,6 +203,21 @@ class FusedCombine(torch.autograd.Function):
         return grad_x, None, None, None, None
 
 
+def dispatch_wait(after_event):
+    """Wait for an async dispatch/combine to complete on the current CUDA stream.
+
+    Call this after overlapping computation has been issued to synchronise
+    the default stream with the communication stream.
+
+    Args:
+        after_event: The event returned as the last element of
+            ``fused_dispatch(..., async_finish=True)``.  If *None*
+            (sync mode), this is a no-op.
+    """
+    if after_event is not None:
+        after_event.current_stream_wait()
+
+
 if HAVE_DEEP_EP:
 
     def fused_dispatch(
@@ -211,7 +229,7 @@ if HAVE_DEEP_EP:
         async_finish=False,
         allocate_on_comm_stream=False,
     ):
-        """Perform fused dispatch operation if deep_ep is available.
+        """Perform fused dispatch operation.
 
         Args:
             x: Input tensor [num_tokens, hidden_size]
@@ -219,10 +237,18 @@ if HAVE_DEEP_EP:
             token_probs: Token routing probabilities [num_tokens, topk]
             num_experts: Number of experts
             group: Process group
-            previous_event: Previous CUDA event
+            async_finish: If True, dispatch runs asynchronously on the
+                communication stream.  The caller **must** call
+                ``dispatch_wait(after_event)`` after issuing any
+                overlapping computation.
+            allocate_on_comm_stream: If True, allocate output tensors on the
+                communication stream so the default stream stays unblocked.
 
         Returns:
-            Result of FusedDispatch
+            (recv_x, recv_token_indices, recv_token_probs,
+             tokens_per_expert, handle, after_event)
+
+            *after_event* is ``None`` when ``async_finish=False``.
         """
         return FusedDispatch.apply(
             x.contiguous(),
@@ -235,16 +261,23 @@ if HAVE_DEEP_EP:
         )
 
     def fused_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False):
-        """Perform fused combine operation if deep_ep is available.
+        """Perform fused combine operation.
 
         Args:
-            x: Input tensor
+            x: Input tensor (expert outputs)
             group: Process group
-            handle: Communication handle
-            previous_event: Previous CUDA event
+            handle: Communication handle from the dispatch phase
+            async_finish: If True, combine runs asynchronously on the
+                communication stream.  The caller **must** call
+                ``dispatch_wait(after_event)`` after issuing any
+                overlapping computation.
+            allocate_on_comm_stream: If True, allocate output tensors on the
+                communication stream so the default stream stays unblocked.
 
         Returns:
-            Result of FusedCombine
+            (combined_x, None, after_event)
+
+            *after_event* is ``None`` when ``async_finish=False``.
         """
         return FusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
 
@@ -255,6 +288,7 @@ if HAVE_DEEP_EP:
 else:
     fused_dispatch = None
     fused_combine = None
+    dispatch_wait = None
     set_deepep_num_sms = None
 
 

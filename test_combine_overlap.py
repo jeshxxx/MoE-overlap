@@ -1,10 +1,16 @@
 """
-Test: overlap FusedDispatch all-to-all communication with Linear computation.
+Test: overlap FusedCombine all-to-all communication with Linear computation.
+
+Typical MoE layer timeline:
+    dispatch (a2a) -> expert FFN -> combine (a2a) -> next-layer attention
+
+This script benchmarks overlapping the *combine* phase with an independent
+linear layer (simulating next-layer attention projection).
 
 Run (mpirun):
-    mpirun --allow-run-as-root -np 8 python3 test_overlap.py
+    mpirun --allow-run-as-root -np 8 python3 test_combine_overlap.py
 Run (torchrun):
-    torchrun --nproc_per_node=8 test_overlap.py
+    torchrun --nproc_per_node=8 test_combine_overlap.py
 """
 
 import os
@@ -16,6 +22,7 @@ import torch.distributed as dist
 
 from fused_a2a import (
     fused_dispatch,
+    fused_combine,
     dispatch_wait,
     set_deepep_num_sms,
 )
@@ -72,32 +79,44 @@ def setup():
 
 
 # ---------------------------------------------------------------------------
-# Sequential vs Overlapped execution
+# Prepare dispatch handle (run once, shared by all benchmark iterations)
 # ---------------------------------------------------------------------------
 
-def run_dispatch_then_linear(x, token_indices, token_probs, num_experts,
-                             group, linear, linear_input):
-    """Sequential: synchronous dispatch, then linear."""
-    recv_x, recv_ti, recv_tp, tpe, handle, event = fused_dispatch(
+def prepare_dispatch(x, token_indices, token_probs, num_experts, group):
+    """Run a synchronous dispatch and return (recv_x, handle)."""
+    recv_x, _, _, _, handle, event = fused_dispatch(
         x, token_indices, token_probs, num_experts, group,
         async_finish=False,
     )
     dispatch_wait(event)
+    return recv_x, handle
+
+
+# ---------------------------------------------------------------------------
+# Sequential vs Overlapped combine
+# ---------------------------------------------------------------------------
+
+def run_combine_then_linear(expert_out, group, handle, linear, linear_input):
+    """Sequential: synchronous combine, then linear."""
+    combined_x, _, event = fused_combine(
+        expert_out, group, handle,
+        async_finish=False,
+    )
+    dispatch_wait(event)
     linear_out = linear(linear_input)
-    return recv_x, linear_out, handle
+    return combined_x, linear_out
 
 
-def run_dispatch_overlap_linear(x, token_indices, token_probs, num_experts,
-                                group, linear, linear_input):
-    """Overlapped: async dispatch || linear, then sync."""
-    recv_x, recv_ti, recv_tp, tpe, handle, event = fused_dispatch(
-        x, token_indices, token_probs, num_experts, group,
+def run_combine_overlap_linear(expert_out, group, handle, linear, linear_input):
+    """Overlapped: async combine || linear, then sync."""
+    combined_x, _, event = fused_combine(
+        expert_out, group, handle,
         async_finish=True,
         allocate_on_comm_stream=True,
     )
     linear_out = linear(linear_input)
     dispatch_wait(event)
-    return recv_x, linear_out, handle
+    return combined_x, linear_out
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +147,7 @@ def bench(fn, num_warmup=5, num_iters=20, **kwargs):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark FusedDispatch + Linear overlap")
+        description="Benchmark FusedCombine + Linear overlap")
     parser.add_argument("--num-tokens", type=int, default=4096)
     parser.add_argument("--hidden-size", type=int, default=4096)
     parser.add_argument("--experts-per-rank", type=int, default=8)
@@ -157,35 +176,41 @@ def main():
     token_probs = torch.randn(
         args.num_tokens, args.topk, device=device, dtype=torch.float32
     ).softmax(dim=-1)
+
+    # Independent input for the linear (simulates next-layer attention data)
     linear_input = torch.randn(args.num_tokens, args.hidden_size,
                                device=device, dtype=torch.bfloat16)
-
     linear = nn.Linear(args.hidden_size, ffn_hidden, bias=False,
                        device=device, dtype=torch.bfloat16)
 
     group = dist.group.WORLD
 
+    # ---- prepare: run dispatch once to get recv_x and handle ----
+    recv_x, handle = prepare_dispatch(
+        x, token_indices, token_probs, num_experts, group)
+
+    # Simulate expert FFN output (same shape as recv_x)
+    expert_out = torch.randn_like(recv_x)
+
     common = dict(
-        x=x,
-        token_indices=token_indices,
-        token_probs=token_probs,
-        num_experts=num_experts,
+        expert_out=expert_out,
         group=group,
+        handle=handle,
         linear=linear,
         linear_input=linear_input,
     )
 
     # ---- benchmark ----
-    t_seq = bench(run_dispatch_then_linear,
+    t_seq = bench(run_combine_then_linear,
                   num_warmup=args.num_warmup, num_iters=args.num_iters,
                   **common)
-    t_ovlp = bench(run_dispatch_overlap_linear,
+    t_ovlp = bench(run_combine_overlap_linear,
                    num_warmup=args.num_warmup, num_iters=args.num_iters,
                    **common)
 
     if rank == 0:
         print("=" * 60)
-        print("  FusedDispatch + Linear Overlap Benchmark")
+        print("  FusedCombine + Linear Overlap Benchmark")
         print("=" * 60)
         print(f"  Tokens       : {args.num_tokens}")
         print(f"  Hidden       : {args.hidden_size}")
@@ -195,8 +220,8 @@ def main():
         print(f"  GPUs         : {world_size}")
         print(f"  Warmup/Iters : {args.num_warmup} / {args.num_iters}")
         print("-" * 60)
-        print(f"  Sequential  (dispatch ; linear) : {t_seq:.3f} ms")
-        print(f"  Overlapped  (dispatch || linear) : {t_ovlp:.3f} ms")
+        print(f"  Sequential  (combine ; linear) : {t_seq:.3f} ms")
+        print(f"  Overlapped  (combine || linear) : {t_ovlp:.3f} ms")
         speedup = t_seq / t_ovlp if t_ovlp > 0 else float("inf")
         saving_pct = (1 - t_ovlp / t_seq) * 100 if t_seq > 0 else 0
         print(f"  Speedup      : {speedup:.2f}x")
